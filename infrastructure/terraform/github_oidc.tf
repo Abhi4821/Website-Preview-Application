@@ -41,7 +41,8 @@ resource "aws_iam_role" "github_actions" {
       Condition = {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-          "token.actions.githubusercontent.com:sub" = "repo:Abhi4821/Website-Preview-Application:ref:refs/heads/main"
+          #   "token.actions.githubusercontent.com:sub" = "repo:Abhi4821/Website-Preview-Application:ref:refs/heads/main"
+          "token.actions.githubusercontent.com:sub" = "repo:Abhi4821@190111152/Website-Preview-Application@1444064735:ref:refs/heads/main"
         }
       }
     }]
@@ -75,8 +76,17 @@ resource "aws_iam_role_policy" "github_actions_deploy" {
         Sid    = "ECRPush"
         Effect = "Allow"
 
+        # Action = [
+        #   "ecr:BatchCheckLayerAvailability",
+        #   "ecr:InitiateLayerUpload",
+        #   "ecr:UploadLayerPart",
+        #   "ecr:CompleteLayerUpload",
+        #   "ecr:PutImage"
+        # ]
+
         Action = [
           "ecr:BatchCheckLayerAvailability",
+          "ecr:BatchGetImage",
           "ecr:InitiateLayerUpload",
           "ecr:UploadLayerPart",
           "ecr:CompleteLayerUpload",

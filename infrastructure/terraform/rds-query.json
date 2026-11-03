@@ -1,0 +1,11 @@
+{
+    "Parameters":  {
+                       "commands":  [
+                                        "docker exec website-preview-backend python -c \"import os,pymysql; c=pymysql.connect(host=os.environ[\u0027DB_HOST\u0027],user=os.environ[\u0027DB_USER\u0027],password=os.environ[\u0027DB_PASSWORD\u0027],database=os.environ[\u0027DB_NAME\u0027],port=int(os.getenv(\u0027DB_PORT\u0027,\u00273306\u0027))); cur=c.cursor(); cur.execute(\u0027SELECT id, full_name, email, is_active, created_at FROM users ORDER BY id DESC\u0027); print(\u0027RDS USERS DATA:\u0027); [print(r) for r in cur.fetchall()]; cur.close(); c.close()\""
+                                    ]
+                   },
+    "DocumentName":  "AWS-RunShellScript",
+    "InstanceIds":  [
+                        "i-0c41110588840dc25"
+                    ]
+}
