@@ -20,3 +20,15 @@ npm-debug.log*
 .idea/
 .DS_Store
 Thumbs.db
+
+# Terraform generated files (never commit state or plans)
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+
+# Temporary deployment files
+ssm-params.json

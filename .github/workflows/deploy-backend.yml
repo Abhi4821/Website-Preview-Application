@@ -1,0 +1,310 @@
+﻿name: Deploy Backend to AWS
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "backend/**"
+      - ".github/workflows/deploy-backend.yml"
+
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: website-preview-backend-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: website-preview-backend
+  EC2_INSTANCE_ID: i-0c41110588840dc25
+  DB_HOST: website-preview-mysql.czgk04660hc5.ap-south-1.rds.amazonaws.com
+  DB_NAME: website_preview
+  DB_PORT: "3306"
+  DB_SECRET_ID: rds!db-f27b5a6b-dc52-48e0-950a-473260f14ea5
+  APP_SECRET_ID: website-preview/app-config
+
+jobs:
+  build-and-deploy:
+    name: Build, Push and Deploy Backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push Backend Image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          echo "Building backend image: $IMAGE_URI"
+
+          docker build \
+            --pull \
+            -t "$IMAGE_URI" \
+            ./backend
+
+          docker push "$IMAGE_URI"
+
+          echo "Backend image pushed successfully."
+
+      - name: Prepare Deployment Script
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+          cat > deploy.sh <<'DEPLOY_SCRIPT'
+          #!/bin/bash
+          set -Eeuo pipefail
+          set +x
+
+          REGION="ap-south-1"
+          IMAGE_URI="__IMAGE_URI__"
+          DB_HOST="website-preview-mysql.czgk04660hc5.ap-south-1.rds.amazonaws.com"
+          DB_NAME="website_preview"
+          DB_PORT="3306"
+          DB_SECRET_ID="rds!db-f27b5a6b-dc52-48e0-950a-473260f14ea5"
+          APP_SECRET_ID="website-preview/app-config"
+
+          APP_DIR="/opt/website-preview"
+          ENV_FILE="$APP_DIR/backend.env"
+          CONTAINER="website-preview-backend"
+          PREVIOUS="website-preview-backend-previous"
+
+          mkdir -p "$APP_DIR"
+          chmod 700 "$APP_DIR"
+
+          echo "Starting backend deployment."
+
+          # Authenticate EC2 with ECR.
+          aws ecr get-login-password --region "$REGION" \
+            | docker login --username AWS --password-stdin \
+              "${IMAGE_URI%%/*}"
+
+          # Pull the exact immutable image.
+          docker pull "$IMAGE_URI"
+
+          # Retrieve production database credentials.
+          RDS_SECRET_JSON=$(aws secretsmanager get-secret-value \
+            --secret-id "$DB_SECRET_ID" \
+            --region "$REGION" \
+            --query SecretString \
+            --output text)
+
+          export RDS_SECRET_JSON
+
+          DB_USER=$(python3 -c \
+            'import json,os; print(json.loads(os.environ["RDS_SECRET_JSON"])["username"])')
+
+          DB_PASSWORD=$(python3 -c \
+            'import json,os; print(json.loads(os.environ["RDS_SECRET_JSON"])["password"])')
+
+          unset RDS_SECRET_JSON
+
+          # Retrieve application JWT configuration.
+          APP_SECRET_JSON=$(aws secretsmanager get-secret-value \
+            --secret-id "$APP_SECRET_ID" \
+            --region "$REGION" \
+            --query SecretString \
+            --output text)
+
+          export APP_SECRET_JSON
+
+          JWT_SECRET_KEY=$(python3 -c \
+            'import json,os; print(json.loads(os.environ["APP_SECRET_JSON"])["JWT_SECRET_KEY"])')
+
+          JWT_ALGORITHM=$(python3 -c \
+            'import json,os; print(json.loads(os.environ["APP_SECRET_JSON"])["JWT_ALGORITHM"])')
+
+          ACCESS_TOKEN_EXPIRE_MINUTES=$(python3 -c \
+            'import json,os; print(json.loads(os.environ["APP_SECRET_JSON"])["ACCESS_TOKEN_EXPIRE_MINUTES"])')
+
+          unset APP_SECRET_JSON
+
+          # Validate required production configuration.
+          if [ -z "$DB_USER" ] || [ -z "$DB_PASSWORD" ] || \
+             [ -z "$JWT_SECRET_KEY" ] || [ "${#JWT_SECRET_KEY}" -lt 32 ]; then
+            echo "Required production configuration is missing or invalid."
+            exit 1
+          fi
+
+          if [ "$JWT_ALGORITHM" != "HS256" ]; then
+            echo "Unsupported JWT algorithm."
+            exit 1
+          fi
+
+          # Write environment configuration without printing secrets.
+          umask 077
+
+          {
+            printf 'APP_ENV=production\n'
+            printf 'DB_HOST=%s\n' "$DB_HOST"
+            printf 'DB_PORT=%s\n' "$DB_PORT"
+            printf 'DB_NAME=%s\n' "$DB_NAME"
+            printf 'DB_USER=%s\n' "$DB_USER"
+            printf 'DB_PASSWORD=%s\n' "$DB_PASSWORD"
+            printf 'JWT_SECRET_KEY=%s\n' "$JWT_SECRET_KEY"
+            printf 'JWT_ALGORITHM=%s\n' "$JWT_ALGORITHM"
+            printf 'ACCESS_TOKEN_EXPIRE_MINUTES=%s\n' "$ACCESS_TOKEN_EXPIRE_MINUTES"
+          } > "$ENV_FILE"
+
+          chmod 600 "$ENV_FILE"
+
+          unset DB_PASSWORD JWT_SECRET_KEY
+
+          # Run database migrations before replacing the running container.
+          echo "Running Alembic database migrations."
+
+          docker run --rm \
+            --env-file "$ENV_FILE" \
+            "$IMAGE_URI" \
+            alembic -c alembic.ini upgrade head
+
+          echo "Database migrations completed."
+
+          # Preserve the currently running container for rollback.
+          docker rm -f "$PREVIOUS" >/dev/null 2>&1 || true
+
+          if docker container inspect "$CONTAINER" >/dev/null 2>&1; then
+            docker stop "$CONTAINER"
+            docker rename "$CONTAINER" "$PREVIOUS"
+          fi
+
+          # Start the new backend container.
+          if ! docker run -d \
+            --name "$CONTAINER" \
+            --restart unless-stopped \
+            --env-file "$ENV_FILE" \
+            -p 80:8000 \
+            "$IMAGE_URI"; then
+
+            echo "New container failed to start."
+
+            if docker container inspect "$PREVIOUS" >/dev/null 2>&1; then
+              docker rename "$PREVIOUS" "$CONTAINER"
+              docker start "$CONTAINER"
+            fi
+
+            exit 1
+          fi
+
+          # Verify application health.
+          HEALTHY=false
+
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1/health >/dev/null; then
+              HEALTHY=true
+              break
+            fi
+
+            echo "Waiting for backend health check: $attempt/30"
+            sleep 5
+          done
+
+          if [ "$HEALTHY" != "true" ]; then
+            echo "Health check failed."
+            docker logs --tail 100 "$CONTAINER" || true
+            docker rm -f "$CONTAINER" || true
+
+            if docker container inspect "$PREVIOUS" >/dev/null 2>&1; then
+              docker rename "$PREVIOUS" "$CONTAINER"
+              docker start "$CONTAINER"
+              echo "Previous container restored."
+            else
+              echo "No previous container available for rollback."
+            fi
+
+            exit 1
+          fi
+
+          echo "Backend health check passed."
+
+          # Remove old container only after successful health check.
+          docker rm -f "$PREVIOUS" >/dev/null 2>&1 || true
+
+          echo "Backend deployment completed successfully."
+          docker ps --filter "name=$CONTAINER"
+
+          DEPLOY_SCRIPT
+
+          sed -i "s|__IMAGE_URI__|$IMAGE_URI|g" deploy.sh
+
+      - name: Deploy Backend on EC2 using SSM
+        run: |
+          set -euo pipefail
+
+          jq -n --rawfile script deploy.sh \
+            '{commands: [$script]}' > ssm-parameters.json
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Backend deployment $GITHUB_SHA" \
+            --parameters file://ssm-parameters.json \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+
+          for attempt in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query "Status" \
+              --output text 2>/dev/null || true)
+
+            echo "Deployment status: $STATUS"
+
+            case "$STATUS" in
+              Success)
+                echo "EC2 backend deployment successful."
+
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID" \
+                  --query "StandardOutputContent" \
+                  --output text
+
+                exit 0
+                ;;
+
+              Failed|Cancelled|TimedOut)
+                echo "EC2 deployment failed."
+
+                aws ssm get-command-invocation \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$EC2_INSTANCE_ID"
+
+                exit 1
+                ;;
+            esac
+
+            sleep 10
+          done
+
+          echo "SSM deployment polling timed out."
+          exit 1

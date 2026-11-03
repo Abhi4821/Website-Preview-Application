@@ -1,4 +1,7 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -8,10 +11,19 @@ from app.schemas.saved_url import PreviewRequest, SavedURLResponse
 from app.security import get_current_user
 from app.services.preview_service import fetch_preview
 
-router = APIRouter(prefix="/api/urls", tags=["Saved URLs"])
+logger = logging.getLogger(__name__)
+
+router = APIRouter(
+    prefix="/api/urls",
+    tags=["Saved URLs"],
+)
 
 
-@router.post("/preview", response_model=SavedURLResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/preview",
+    response_model=SavedURLResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 def create_preview(
     payload: PreviewRequest,
     db: Session = Depends(get_db),
@@ -19,19 +31,46 @@ def create_preview(
 ):
     try:
         metadata = fetch_preview(str(payload.url))
+
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+
     except Exception:
-        raise HTTPException(status_code=502, detail="Could not fetch this website. It may block automated requests.")
+        logger.exception("Preview generation failed")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Could not generate website preview.",
+        )
 
-    saved = SavedURL(user_id=current_user.id, **metadata)
-    db.add(saved)
-    db.commit()
-    db.refresh(saved)
-    return saved
+    try:
+        saved = SavedURL(
+            user_id=current_user.id,
+            **metadata,
+        )
+
+        db.add(saved)
+        db.commit()
+        db.refresh(saved)
+
+        return saved
+
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Could not save website preview")
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not save website preview.",
+        )
 
 
-@router.get("", response_model=list[SavedURLResponse])
+@router.get(
+    "",
+    response_model=list[SavedURLResponse],
+)
 def list_urls(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -44,31 +83,290 @@ def list_urls(
     )
 
 
-@router.get("/{url_id}", response_model=SavedURLResponse)
+@router.get(
+    "/{url_id}",
+    response_model=SavedURLResponse,
+)
 def get_url(
     url_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    saved = db.query(SavedURL).filter(
-        SavedURL.id == url_id, SavedURL.user_id == current_user.id
-    ).first()
+    saved = (
+        db.query(SavedURL)
+        .filter(
+            SavedURL.id == url_id,
+            SavedURL.user_id == current_user.id,
+        )
+        .first()
+    )
+
     if not saved:
-        raise HTTPException(status_code=404, detail="Saved URL not found.")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Saved URL not found.",
+        )
+
     return saved
 
 
-@router.delete("/{url_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{url_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
 def delete_url(
     url_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    saved = db.query(SavedURL).filter(
-        SavedURL.id == url_id, SavedURL.user_id == current_user.id
-    ).first()
+    saved = (
+        db.query(SavedURL)
+        .filter(
+            SavedURL.id == url_id,
+            SavedURL.user_id == current_user.id,
+        )
+        .first()
+    )
+
     if not saved:
-        raise HTTPException(status_code=404, detail="Saved URL not found.")
-    db.delete(saved)
-    db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Saved URL not found.",
+        )
+
+    try:
+        db.delete(saved)
+        db.commit()
+
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Could not delete saved URL")
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not delete saved URL.",
+        )
+
     return None
+
+
+# import logging
+
+# from fastapi import APIRouter, Depends, HTTPException, status
+# from sqlalchemy.orm import Session
+
+# from app.database import get_db
+# from app.models.saved_url import SavedURL
+# from app.models.user import User
+# from app.schemas.saved_url import PreviewRequest, SavedURLResponse
+# from app.security import get_current_user
+# from app.services.preview_service import fetch_preview
+
+
+# logger = logging.getLogger(__name__)
+
+# router = APIRouter(prefix="/api/urls", tags=["Saved URLs"])
+
+
+# @router.post(
+#     "/preview",
+#     response_model=SavedURLResponse,
+#     status_code=status.HTTP_201_CREATED,
+# )
+# def create_preview(
+#     payload: PreviewRequest,
+#     db: Session = Depends(get_db),
+#     current_user: User = Depends(get_current_user),
+# ):
+
+#     try:
+#         metadata = fetch_preview(str(payload.url))
+
+#     except ValueError as exc:
+#         raise HTTPException(
+#             status_code=status.HTTP_400_BAD_REQUEST,
+#             detail=str(exc),
+#         )
+
+#     except Exception:
+#         logger.exception("Preview generation failed")
+
+#         raise HTTPException(
+#             status_code=status.HTTP_502_BAD_GATEWAY,
+#             detail="Could not generate website preview.",
+#         )
+
+#     try:
+
+#         saved = SavedURL(
+#             user_id=current_user.id,
+#             **metadata,
+#         )
+
+#         db.add(saved)
+#         db.commit()
+#         db.refresh(saved)
+
+#         return saved
+
+#     except Exception:
+#         db.rollback()
+
+#         logger.exception("Could not save website preview")
+
+#         raise HTTPException(
+#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+#             detail="Could not save website preview.",
+#         )
+
+
+# @router.get(
+#     "",
+#     response_model=list[SavedURLResponse],
+# )
+# def list_urls(
+#     db: Session = Depends(get_db),
+#     current_user: User = Depends(get_current_user),
+# ):
+
+#     return (
+#         db.query(SavedURL)
+#         .filter(SavedURL.user_id == current_user.id)
+#         .order_by(SavedURL.created_at.desc())
+#         .all()
+#     )
+
+
+# @router.get(
+#     "/{url_id}",
+#     response_model=SavedURLResponse,
+# )
+# def get_url(
+#     url_id: int,
+#     db: Session = Depends(get_db),
+#     current_user: User = Depends(get_current_user),
+# ):
+
+#     saved = (
+#         db.query(SavedURL)
+#         .filter(
+#             SavedURL.id == url_id,
+#             SavedURL.user_id == current_user.id,
+#         )
+#         .first()
+#     )
+
+#     if not saved:
+#         raise HTTPException(
+#             status_code=status.HTTP_404_NOT_FOUND,
+#             detail="Saved URL not found.",
+#         )
+
+#     return saved
+
+
+# @router.delete(
+#     "/{url_id}",
+#     status_code=status.HTTP_204_NO_CONTENT,
+# )
+# def delete_url(
+#     url_id: int,
+#     db: Session = Depends(get_db),
+#     current_user: User = Depends(get_current_user),
+# ):
+
+#     saved = (
+#         db.query(SavedURL)
+#         .filter(
+#             SavedURL.id == url_id,
+#             SavedURL.user_id == current_user.id,
+#         )
+#         .first()
+#     )
+
+#     if not saved:
+#         raise HTTPException(
+#             status_code=status.HTTP_404_NOT_FOUND,
+#             detail="Saved URL not found.",
+#         )
+
+#     db.delete(saved)
+#     db.commit()
+
+#     return None
+
+
+# # from fastapi import APIRouter, Depends, HTTPException, status
+# # from sqlalchemy.orm import Session
+
+# # from app.database import get_db
+# # from app.models.saved_url import SavedURL
+# # from app.models.user import User
+# # from app.schemas.saved_url import PreviewRequest, SavedURLResponse
+# # from app.security import get_current_user
+# # from app.services.preview_service import fetch_preview
+
+# # router = APIRouter(prefix="/api/urls", tags=["Saved URLs"])
+
+
+# # @router.post("/preview", response_model=SavedURLResponse, status_code=status.HTTP_201_CREATED)
+# # def create_preview(
+# #     payload: PreviewRequest,
+# #     db: Session = Depends(get_db),
+# #     current_user: User = Depends(get_current_user),
+# # ):
+# #     try:
+# #         metadata = fetch_preview(str(payload.url))
+# #     except ValueError as exc:
+# #         raise HTTPException(status_code=400, detail=str(exc))
+# #     except Exception:
+# #         raise HTTPException(status_code=502, detail="Could not fetch this website. It may block automated requests.")
+
+# #     saved = SavedURL(user_id=current_user.id, **metadata)
+# #     db.add(saved)
+# #     db.commit()
+# #     db.refresh(saved)
+# #     return saved
+
+
+# # @router.get("", response_model=list[SavedURLResponse])
+# # def list_urls(
+# #     db: Session = Depends(get_db),
+# #     current_user: User = Depends(get_current_user),
+# # ):
+# #     return (
+# #         db.query(SavedURL)
+# #         .filter(SavedURL.user_id == current_user.id)
+# #         .order_by(SavedURL.created_at.desc())
+# #         .all()
+# #     )
+
+
+# # @router.get("/{url_id}", response_model=SavedURLResponse)
+# # def get_url(
+# #     url_id: int,
+# #     db: Session = Depends(get_db),
+# #     current_user: User = Depends(get_current_user),
+# # ):
+# #     saved = db.query(SavedURL).filter(
+# #         SavedURL.id == url_id, SavedURL.user_id == current_user.id
+# #     ).first()
+# #     if not saved:
+# #         raise HTTPException(status_code=404, detail="Saved URL not found.")
+# #     return saved
+
+
+# # @router.delete("/{url_id}", status_code=status.HTTP_204_NO_CONTENT)
+# # def delete_url(
+# #     url_id: int,
+# #     db: Session = Depends(get_db),
+# #     current_user: User = Depends(get_current_user),
+# # ):
+# #     saved = db.query(SavedURL).filter(
+# #         SavedURL.id == url_id, SavedURL.user_id == current_user.id
+# #     ).first()
+# #     if not saved:
+# #         raise HTTPException(status_code=404, detail="Saved URL not found.")
+# #     db.delete(saved)
+# #     db.commit()
+# #     return None
